@@ -6,14 +6,16 @@ import io
 import openai 
 import math
 
-# ==========================================
-# 1. 网页全局设置与记忆初始化
-# ==========================================
-st.set_page_config(layout="wide", page_title="抽油杆智能化工具 (商业级)")
-st.title("🛢️ 抽油杆多级管柱综合诊断系统 (Copilot 版)")
+st.set_page_config(layout="wide", page_title="抽油杆智能化工具 (终极版)")
+st.title("🛢️ 抽油杆多级管柱综合诊断系统 (Copilot 终极版)")
 
+# ==========================================
+# 1. 初始化永久记忆（修复跳出 Bug 的核心机制）
+# ==========================================
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "is_calculated" not in st.session_state:
+    st.session_state.is_calculated = False
 
 # ==========================================
 # 2. 侧边栏：专业级井况与工具配置面板
@@ -26,7 +28,6 @@ with st.sidebar:
                                ["73.0 / 62.0 (2 7/8\")", "88.9 / 76.0 (3 1/2\")", "60.3 / 50.3 (2 3/8\")"])
     tubing_id = float(tubing_size.split('/')[1].split('(')[0].strip()) 
     
-    # 井下工具与环境
     col_t1, col_t2 = st.columns(2)
     with col_t1:
         use_anchor = st.checkbox("🔧 设油管锚", value=True, help="消除管柱弹性伸缩，增加杆柱有效载荷")
@@ -45,8 +46,6 @@ with st.sidebar:
     pump_diameter = st.selectbox("泵径 (mm)", [32, 38, 44, 57, 70], index=2)
     
     st.markdown("### 3. 多级抽油杆组合设计 (从下往上)")
-    st.caption("💡 提示：可双击表格直接修改数值，或在最下方点击 ➕ 新增杆段")
-    # 默认三级组合配杆表
     default_rod_data = pd.DataFrame({
         "段号": ["底部段 (接泵)", "中部段", "顶部段 (接悬点)"],
         "外径(mm)": [19.0, 22.0, 25.0],
@@ -68,27 +67,29 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
+    # 关键机制：用户只要点过一次按钮，就刻入记忆
+    if btn_calc:
+        st.session_state.is_calculated = True
+
 # ==========================================
 # 3. 核心计算大脑 (分段微元法)
 # ==========================================
-# 预备变量
 result_df = pd.DataFrame()
 total_depth = rod_df["长度(m)"].sum() if not rod_df.empty else 1500
 min_safety = 99
 current_context = ""
 fig = go.Figure()
 
-if btn_calc and not rod_df.empty:
+# 改由 st.session_state.is_calculated 触发，保证刷新网页不会丢失计算结果
+if st.session_state.is_calculated and not rod_df.empty:
     g = 9.81
     rho_steel = 7850
     r_p = (pump_diameter / 2) / 1000
     A_p = 3.14159 * (r_p ** 2)
     
-    # 动态载荷加速度参数
     omega = 2 * 3.14159 * stroke_rate / 60
     a_max = (stroke_length / 2) * (omega ** 2)
     
-    # 液柱载荷 (油管锚定系数)
     anchor_factor = 1.0 if use_anchor else 0.85 
     W_f = A_p * total_depth * fluid_density * g * anchor_factor
     
@@ -96,42 +97,35 @@ if btn_calc and not rod_df.empty:
     cumulative_dynamic = 0
     section_results = []
     
-    # 从下往上（反向遍历表）逐级递推计算
     rod_sections = rod_df.iloc[::-1].to_dict('records')
     
     for idx, row in enumerate(rod_sections):
-        d_mm = max(float(row["外径(mm)"]), 1) # 防止填 0 报错
+        d_mm = max(float(row["外径(mm)"]), 1) 
         L_m = float(row["长度(m)"])
         grade = row["钢级"]
         
         A_r = 3.14159 * ((d_mm / 2) / 1000) ** 2
         
-        # 本段自重与扶正器重量
         W_self = A_r * L_m * rho_steel * g
         W_cent = (L_m / 100) * centralizer_density * 2 * g 
         W_section = W_self + W_cent
         
-        # 水力阻力 (环空越小阻力越大)
         clearance = max(tubing_id - d_mm, 1)
         hydraulic_drag = (1 / clearance) * 50 * L_m 
         
-        # 惯性动载荷
         F_d_section = W_section * (a_max / g)
         
-        # 累加下方所有重量和动载荷
         cumulative_weight += W_section
         cumulative_dynamic += F_d_section
         
-        # 计算该段【最顶部】的最大静载荷 + 动载荷
         max_load_here = cumulative_weight + cumulative_dynamic + W_f + hydraulic_drag
-        if use_echo and idx == len(rod_sections) - 1: # 顶部加回音标质量
+        if use_echo and idx == len(rod_sections) - 1: 
             max_load_here += 5 * g * (1 + a_max/g)
             
-        stress_here = (max_load_here / A_r) / 1000000 # MPa
+        stress_here = (max_load_here / A_r) / 1000000 
         
-        # 许用应力判断
         yield_map = {"C": 413, "D": 586, "K": 413, "H": 792}
-        allowable = yield_map.get(grade[0].upper(), 586) # 取首字母防错
+        allowable = yield_map.get(str(grade)[0].upper(), 586) 
         safety_here = allowable / stress_here if stress_here > 0 else 99
         
         section_results.append({
@@ -144,7 +138,6 @@ if btn_calc and not rod_df.empty:
             "安全系数": round(safety_here, 2)
         })
 
-    # 将结果反转回从上往下的视觉顺序
     result_df = pd.DataFrame(section_results[::-1])
     min_safety = result_df["安全系数"].min()
 
@@ -152,7 +145,7 @@ if btn_calc and not rod_df.empty:
     # 4. 智能化 3D 渲染 (带粗细阶梯的真实管柱)
     # ==========================================
     current_z = 0
-    visual_exaggeration = 8 # 半径视觉放大 8 倍以便看清粗细变化
+    visual_exaggeration = 8 
 
     for i, row in result_df.iterrows():
         L_m = row["长度(m)"]
@@ -163,26 +156,22 @@ if btn_calc and not rod_df.empty:
         theta = np.linspace(0, 2*np.pi, 20)
         theta_grid, z_grid = np.meshgrid(theta, z_raw)
         
-        # 视觉半径
         r_render = ((d_mm / 2) / 1000) * visual_exaggeration
         x_grid = r_render * np.cos(theta_grid)
         y_grid = r_render * np.sin(theta_grid)
         
-        # 给这一段赋予对应的应力颜色
         color_grid = np.full(z_grid.shape, stress)
         
         fig.add_trace(go.Surface(
             x=x_grid, y=y_grid, z=z_grid,
             surfacecolor=color_grid, colorscale='Jet',
-            cmin=0, cmax=800, showscale=(i==0), # 只显示一次图例
+            cmin=0, cmax=800, showscale=(i==0), 
             colorbar=dict(title="应力(MPa)", x=-0.1) if i==0 else None,
             showlegend=False, name=f"外径 {d_mm}mm"
         ))
         current_z += L_m
 
-    # 添加井下工具标记 (3D 视觉元素)
     if use_anchor:
-        # 在最底部画一个红色的圆环代表油管锚
         z_anchor = np.linspace(total_depth - 2, total_depth, 5)
         theta_a, z_a_grid = np.meshgrid(theta, z_anchor)
         r_anchor = r_render * 2.5
@@ -200,7 +189,6 @@ if btn_calc and not rod_df.empty:
         scene_camera=dict(eye=dict(x=1.5, y=1.5, z=0.5))
     )
 
-    # 构造 AI 提示词矩阵
     context_table = result_df.to_markdown(index=False)
     current_context = f"""
     【当前系统参数】总井深 {total_depth}m, 冲程 {stroke_length}m, 冲次 {stroke_rate}次/min。油管内径 {tubing_id}mm。
@@ -250,7 +238,7 @@ with col_ai:
     if prompt := st.chat_input("向 AI 提问 (例：底部段安全系数太低，我该加粗还是换材质？)"):
         if not api_key:
             st.error("⚠️ 请先在左侧输入 API Key！")
-        elif not current_context:
+        elif not st.session_state.is_calculated:
             st.warning("⚠️ 请先点击左侧运行校核，生成计算数据后再提问！")
         else:
             st.session_state.messages.append({"role": "user", "content": prompt})
@@ -262,7 +250,13 @@ with col_ai:
                     try:
                         client = openai.OpenAI(api_key=api_key, base_url="https://api.siliconflow.cn/v1")
                         api_messages = [{"role": "system", "content": current_context}] + st.session_state.messages
-                        response = client.chat.completions.create(model="deepseek-ai/DeepSeek-V3", messages=api_messages)
+                        
+                        # 核心升级：已替换为阿里 Qwen-72B 大模型，拒绝卡顿！
+                        response = client.chat.completions.create(
+                            model="Qwen/Qwen2.5-72B-Instruct", 
+                            messages=api_messages
+                        )
+                        
                         ai_reply = response.choices[0].message.content
                         message_placeholder.markdown(ai_reply)
                         st.session_state.messages.append({"role": "assistant", "content": ai_reply})
